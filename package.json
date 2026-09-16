@@ -1,0 +1,25 @@
+{
+  "name": "vmo-tst",
+  "version": "1.0.0",
+  "description": "Tài liệu ôn luyện VMO Đà Nẵng 2026-2027",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js",
+    "build": "node build.js",
+    "lint": "node scripts/check-syntax.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "check": "npm run lint && npm run build && npm test"
+  },
+  "dependencies": {
+    "@google/genai": "^2.22.0",
+    "compression": "^1.8.2",
+    "express": "^4.21.2",
+    "firebase": "^12.19.0",
+    "helmet": "^8.3.0"
+  },
+  "devDependencies": {
+    "jsdom": "^30.0.1",
+    "supertest": "^7.1.4"
+  }
+}

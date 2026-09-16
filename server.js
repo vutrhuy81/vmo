@@ -1,0 +1,477 @@
+import express from 'express';
+import path from 'path';
+import compression from 'compression';
+import helmet from 'helmet';
+import { fileURLToPath } from 'url';
+import { build } from './build.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Tự động tổng hợp mã nguồn từ thư mục src/ khi máy chủ khởi động
+try {
+  build();
+} catch (err) {
+  console.warn('[Build Warning]: Không thể tự động build khi khởi động:', err.message);
+}
+
+const app = express();
+const PORT = 3000;
+app.disable('x-powered-by');
+app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+
+const aiRequests = new Map();
+function aiRateLimit(req, res, next) {
+  const now = Date.now(), key = req.ip || 'unknown';
+  const recent = (aiRequests.get(key) || []).filter(t => now - t < 600000);
+  if (recent.length >= 30) return res.status(429).json({ success: false, code: 'RATE_LIMITED', message: 'Quá nhiều yêu cầu AI.' });
+  recent.push(now); aiRequests.set(key, recent); next();
+}
+async function requireFirebaseAuth(req, res, next) {
+  const token = (req.get('authorization') || '').replace(/^Bearer\s+/i, '');
+  const apiKey = process.env.FIREBASE_WEB_API_KEY;
+  if (!token) return res.status(401).json({ success: false, code: 'AUTH_REQUIRED', message: 'Yêu cầu đăng nhập Google.' });
+  if (!apiKey) return res.status(503).json({ success: false, code: 'AUTH_NOT_CONFIGURED', message: 'Máy chủ chưa cấu hình Firebase.' });
+  try {
+    const response = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(apiKey)}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ idToken: token }), signal: AbortSignal.timeout(8000) });
+    const data = await response.json();
+    if (!response.ok || !data.users?.[0]) return res.status(401).json({ success: false, code: 'INVALID_TOKEN', message: 'Phiên đăng nhập không hợp lệ.' });
+    req.firebaseUser = data.users[0]; next();
+  } catch (_) { return res.status(503).json({ success: false, code: 'AUTH_UNAVAILABLE', message: 'Không thể kiểm tra phiên đăng nhập.' }); }
+}
+
+// Parse JSON and URL-encoded request bodies with 25MB limit to support handwritten math images
+app.use(express.json({ limit: '25mb' }));
+app.use(express.urlencoded({ extended: true, limit: '25mb' }));
+
+// Enable gzip/deflate compression for fast asset delivery
+app.use(compression());
+
+// Model Cooldown Tracker for transient 503/429/overload errors
+const modelCooldownMap = new Map();
+
+function getOrderedCandidateModels() {
+  // Ưu tiên gemini-2.5-flash vì tốc độ phản hồi cao, tính ổn định và khả năng suy luận toán học xuất sắc
+  const models = ['gemini-2.5-flash', 'gemini-3.1-flash-lite', 'gemini-3.8-flash', 'gemini-flash-latest'];
+  const now = Date.now();
+  return [...models].sort((a, b) => {
+    const cdA = modelCooldownMap.get(a) || 0;
+    const cdB = modelCooldownMap.get(b) || 0;
+    const isColdA = cdA > now;
+    const isColdB = cdB > now;
+    if (isColdA === isColdB) return 0;
+    return isColdA ? 1 : -1;
+  });
+}
+
+function markModelCooldown(modelName, durationMs = 120000) {
+  modelCooldownMap.set(modelName, Date.now() + durationMs);
+}
+
+// Hàm gọi Gemini với cơ chế tự động chuyển đổi model dự phòng, timeout và chống nghẽn 503
+async function callGeminiWithResilience({ ai, contents, config, label = 'AI' }) {
+  const orderedModels = getOrderedCandidateModels();
+  let lastError = null;
+
+  for (const modelName of orderedModels) {
+    try {
+      const generatePromise = ai.models.generateContent({
+        model: modelName,
+        contents,
+        config
+      });
+
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('TIMEOUT_EXCEEDED')), 10000);
+      });
+
+      const response = await Promise.race([generatePromise, timeoutPromise]);
+      if (response && response.text) {
+        modelCooldownMap.delete(modelName);
+        return { response, usedModel: modelName };
+      }
+    } catch (err) {
+      lastError = err;
+      const errMsg = err.message || '';
+      const isOverloaded = errMsg.includes('503') || errMsg.includes('UNAVAILABLE') ||
+                           errMsg.includes('high demand') || errMsg.includes('unavailable') ||
+                           errMsg.includes('429') || errMsg.includes('RESOURCE_EXHAUSTED') ||
+                           errMsg.includes('TIMEOUT');
+
+      if (isOverloaded) {
+        markModelCooldown(modelName, 120000);
+        console.log(`[Gemini:${label}] Tự động chuyển model dự phòng do ${modelName} tạm thời quá tải hoặc bận.`);
+      } else {
+        console.log(`[Gemini:${label}] Model ${modelName} không phản hồi, thử tiếp model tiếp theo...`);
+      }
+    }
+  }
+
+  return { response: null, usedModel: null, error: lastError };
+}
+
+// Lazy-loaded Gemini AI client
+let aiClient = null;
+let GenAITypes = null;
+async function getGeminiModel() {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+  if (!aiClient) {
+    try {
+      const { GoogleGenAI, Type } = await import('@google/genai');
+      aiClient = new GoogleGenAI({
+        apiKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build'
+          }
+        }
+      });
+      GenAITypes = Type;
+    } catch (e) {
+      console.warn('Không thể khởi tạo GoogleGenAI SDK:', e.message);
+      return null;
+    }
+  }
+  return { client: aiClient, Type: GenAITypes };
+}
+
+// Hàm phân tích JSON an toàn với công thức toán LaTeX
+function parseMathJSON(raw) {
+  if (!raw) return null;
+  let cleaned = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  const firstBrace = cleaned.indexOf('{');
+  const lastBrace = cleaned.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    cleaned = cleaned.substring(firstBrace, lastBrace + 1);
+  }
+  try {
+    return JSON.parse(cleaned);
+  } catch (e1) {
+    try {
+      const fixed = cleaned.replace(/\\/g, (match, offset, full) => {
+        const next = full[offset + 1];
+        if (next === '"' || next === '\\' || next === '/') return '\\';
+        if (next === 'u' && /^[0-9a-fA-F]{4}/.test(full.slice(offset + 2, offset + 6))) return '\\';
+        if (next === 'n' || next === 'r' || next === 't' || next === 'b' || next === 'f') {
+          const rest = full.slice(offset + 1);
+          if (/^[a-zA-Z]{2,}/.test(rest)) return '\\\\';
+          return '\\';
+        }
+        return '\\\\';
+      });
+      return JSON.parse(fixed);
+    } catch (e2) {
+      console.warn('parseMathJSON fallback error:', e2.message);
+      return null;
+    }
+  }
+}
+
+// API Hướng dẫn giải toán chuyên sâu từ AI Giáo sư Toán
+app.post('/api/ai-guide', aiRateLimit, requireFirebaseAuth, async (req, res) => {
+  const { problemId, problemTitle, problemContent, topic, examTitle } = req.body || {};
+
+  try {
+    const aiInstance = await getGeminiModel();
+    if (aiInstance && aiInstance.client) {
+      const { client: ai, Type } = aiInstance;
+
+      const prompt = `Bạn là một Giáo sư Toán học, Chuyên gia đầu ngành bồi dưỡng Học sinh Giỏi Quốc gia môn Toán (VMO) và Tuyển chọn Đội tuyển Quốc tế (TST/IMO).
+Hãy phân tích và viết bài giải toán học đỉnh cao, chuẩn mực Olympic cho bài toán sau:
+
+[KỲ THI/NGUỒN]: ${examTitle || 'Đề thi HSGQG / TST'}
+[CÂU HỎI]: ${problemId || ''} - ${problemTitle || ''}
+[CHUYÊN ĐỀ]: ${topic || 'Toán Olympic THPT'}
+[NỘI DUNG ĐỀ BÀI]:
+${problemContent || ''}
+
+YÊU CẦU BẮT BUỘC CHO TỪNG PHẦN:
+1. knowledge:
+   - Liệt kê chính xác tên các định lý, bổ đề, công thức chuyên sâu THPT Chuyên trực tiếp áp dụng (ví dụ: bổ đề LTE, định lý Euler, cấp số nguyên, phương trình hàm Cauchy, hàng điểm điều hòa, trục đẳng phương, định lý Miquel, bổ đề kẹp Stolz-Cesaro, nguyên lý Dirichlet, bất biến...).
+   - Phát biểu vắn tắt nội dung bổ đề với công thức LaTeX $...$.
+
+2. intuition:
+   - Phân tích tư duy toán học sâu sắc của Giáo sư: Tại sao lại nhận ra hướng đi này? Dấu hiệu nhận biết cấu trúc bài toán, cách tìm nghiệm thử (test cases), phương pháp cô lập biến số hoặc dựng hình phụ.
+
+3. solution:
+   - LỜI GIẢI CHI TIẾT TỪNG BƯỚC (CHUẨN THI HSG QUỐC GIA):
+   - YÊU CẦU ĐẶC BIỆT QUAN TRỌNG: BẮT BUỘC PHẢI GIẢI BÀI TOÁN THẬT SỰ ĐẾN TẬN CÙNG, KHÔNG ĐƯỢC PHÁC THẢO, KHÔNG NÓI CHUNG CHUNG (nghiêm cấm tuyệt đối các câu mơ hồ như "học sinh tự biến đổi", "tương tự ta có", "bước này đơn giản xin dành cho bạn đọc").
+   - Trình bày khúc chiết, đầy đủ tất cả các bước biến đổi toán học, giải tích, đại số, số học, hình học hoặc tổ hợp.
+   - ĐỐI VỚI CÁC BÀI TOÁN HỎI VỀ GIÁ TRỊ (tìm giới hạn dãy số, giải phương trình/hệ phương trình, tìm hàm số, tìm giá trị lớn nhất/nhỏ nhất, tìm bộ số nguyên, đếm số cách, tính hằng số...): BẮT BUỘC PHẢI TÍNH RA ĐÁP SỐ CUỐI CÙNG CỤ THỂ VÀ CHÍNH XÁC, VÀ KẾT THÚC BẰNG DÒNG KẾT LUẬN RÕ RÀNG: **Kết luận:** [đáp số cụ thể] (ví dụ: $\\lim_{n \\to \\infty} x_n = ...$, hoặc $\\min P = ...$ khi $a=b=c=...$, hoặc tập nghiệm $S = \\{ ... \\}$, hoặc $f(x) = ...$).
+   - ĐỐI VỚI CÁC BÀI TOÁN CHỨNG MINH: Lập luận chặt chẽ hai chiều, kiểm tra đầy đủ điều kiện biên và không bỏ sót trường hợp suy biến.
+   - Viết công thức toán học bằng định dạng LaTeX MathJax ($...$ cho công thức nội dòng, $$...$$ cho công thức riêng dòng).
+
+4. pitfalls:
+   - Chỉ rõ các lỗi sai phổ biến mà học sinh chuyên toán hay mắc phải khi làm bài thi khiến bị trừ điểm (quên xét trường hợp biên, quên thử lại nghiệm trong phương trình hàm, chia cho biểu thức có thể bằng 0, nhầm chiều bất đẳng thức, ngộ nhận điểm rơi...).`;
+
+      const { response, usedModel } = await callGeminiWithResilience({
+        ai,
+        contents: prompt,
+        config: {
+          systemInstruction: 'Bạn là Giáo sư - Huấn luyện viên trưởng Đội tuyển Olympic Toán học Quốc tế (IMO) và Quốc gia (VMO). Bạn có năng lực tư duy logic đỉnh cao, giải quyết triệt để mọi bài toán Olympic THPT Chuyên. Bạn luôn viết lời giải thật sự chi tiết từng bước đến tận cùng, không bao giờ phác thảo chung chung, và luôn tính ra kết quả cuối cùng cụ thể đối với các bài toán hỏi giá trị.',
+          responseMimeType: 'application/json',
+          responseSchema: Type ? {
+            type: Type.OBJECT,
+            properties: {
+              knowledge: { type: Type.STRING, description: '1. Kiến thức & Bổ đề chuyên toán cần nắm vững' },
+              intuition: { type: Type.STRING, description: '2. Ý tưởng then chốt & Phân tích của Giáo sư Toán' },
+              solution: { type: Type.STRING, description: '3. Lời giải chi tiết từng bước chuẩn VMO, giải thật sự và tính ra kết quả cuối cùng cụ thể' },
+              pitfalls: { type: Type.STRING, description: '4. Sai lầm phổ biến & Lưu ý khi chấm thi' }
+            },
+            required: ['knowledge', 'intuition', 'solution', 'pitfalls']
+          } : undefined,
+          temperature: 0.1
+        },
+        label: 'Guide'
+      });
+
+      if (response && response.text) {
+        const parsed = parseMathJSON(response.text);
+        if (parsed && (parsed.solution || parsed.knowledge)) {
+          return res.json({
+            success: true,
+            source: 'gemini',
+            model: usedModel,
+            data: parsed
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.log('Gemini generation chuyển sang local expert engine:', err.message);
+  }
+
+  // Fallback to local expert response
+  res.json({
+    success: false,
+    source: 'fallback',
+    message: 'Chuyển sang cơ sở dữ liệu phân tích chuyên gia toán học tích hợp sẵn.'
+  });
+});
+
+// API Đánh giá & Thẩm định bài giải học sinh (Hỗ trợ ảnh viết tay + text) từ AI Giáo sư Toán Olympic
+app.post('/api/ai-evaluate-solution', aiRateLimit, requireFirebaseAuth, async (req, res) => {
+  const {
+    problemId,
+    problemTitle,
+    problemContent,
+    topic,
+    examTitle,
+    solutionText,
+    solutionImage
+  } = req.body || {};
+
+  if (!solutionText && !solutionImage) {
+    return res.status(400).json({
+      success: false,
+      message: 'Vui lòng cung cấp ảnh bài giải hoặc văn bản lời giải để AI đánh giá!'
+    });
+  }
+
+  try {
+    const aiInstance = await getGeminiModel();
+    if (aiInstance && aiInstance.client) {
+      const { client: ai, Type } = aiInstance;
+
+      const promptText = `Bạn là Giáo sư Toán học, Giám khảo Chấm thi và Huấn luyện viên trưởng Đội tuyển Olympic Toán học Quốc gia (VMO) và Quốc tế (TST/IMO).
+Nhiệm vụ của bạn là thẩm định, chấm thi và phân tích bài giải của học sinh cho bài toán sau:
+
+[KỲ THI/NGUỒN]: ${examTitle || 'Kỳ thi Học sinh Giỏi VMO / TST'}
+[BÀI TOÁN]: ${problemId || ''} - ${problemTitle || ''}
+[CHUYÊN ĐỀ]: ${topic || 'Toán Olympic'}
+[ĐỀ BÀI CHÍNH THỨC]:
+${problemContent || 'Đề bài Olympic đã cho.'}
+
+[BÀI LÀM CỦA HỌC SINH]:
+${solutionText ? solutionText : '(Học sinh nộp bài giải dạng hình ảnh viết tay / bản chụp đính kèm)'}
+
+HÃY ĐỌC KỸ TỪNG DÒNG, TỪNG KÝ HIỆU TOÁN HỌC, HÌNH VẼ HOẶC CHỮ VIẾT TAY TRONG ẢNH (NẾU CÓ).
+Hãy đóng vai trò một Chuyên gia Toán học khắt khe, chuẩn mực nhưng tận tâm và xây dựng, phân tích kỹ lưỡng:
+1. PHÂN LOẠI ĐÁNH GIÁ (verdict): Bắt buộc chọn đúng một trong 6 phân loại sau:
+   - "CORRECT_OPTIMAL" (Đúng hoàn toàn & Lời giải tối ưu)
+   - "CORRECT_SUBOPTIMAL" (Đúng & Hợp lệ nhưng chưa tối ưu)
+   - "RIGHT_DIRECTION_INACCURATE" (Đúng hướng đi nhưng chưa chính xác)
+   - "MISSING_CONDITIONS" (Thiếu điều kiện / Bỏ sót trường hợp)
+   - "LOGICAL_GAP" (Có lỗ hổng logic toán học)
+   - "INCORRECT" (Lời giải sai / Ngụy biện)
+
+2. ĐIỂM SỐ ƯỚC TÍNH (estimatedScore): Đưa ra điểm theo thang điểm Olympic VMO (ví dụ: "4.5/5.0đ" hoặc "3.0/5.0đ" hoặc "1.0/5.0đ" kèm giải thích ngắn gọn).
+
+3. TÓM TẮT ĐÁNH GIÁ (summary): Đánh giá tổng quan 2-3 câu về bài làm.
+
+4. PHÂN TÍCH HƯỚNG TIẾP CẬN (approachAnalysis): Phân tích hướng giải của học sinh (đã chọn đúng định lý, bổ đề, hướng biến đổi hay chưa).
+
+5. RÀ SOÁT TỪNG BƯỚC LẬP LUẬN (stepByStep): Đánh giá chi tiết từng bước lập luận:
+   - Các bước làm tốt, biến đổi đúng đắn, lập luận chặt chẽ.
+   - Các bước có vấn đề, lỏng lẻo, nhảy bước (gap) hoặc ngộ nhận.
+   - Trình bày công thức toán học rõ ràng bằng LaTeX ($...$ hoặc $$...$$).
+
+6. LỖ HỔNG LOGIC & THIẾU SÓT (criticalFlaws): Chỉ rõ chính xác dòng hoặc bước bị lỗi, ngụy biện hoặc thiếu điều kiện ràng buộc. Nếu bài đúng hoàn toàn, ghi nhận "Không có lỗ hổng logic đáng kể".
+
+7. LỜI KHUYÊN & LỜI GIẢI TỐI ƯU (recommendations): Hướng dẫn học sinh cách khắc phục thiếu sót, cách trình bày chuẩn VMO tránh bị trừ điểm oan, và gợi ý hướng đi tối ưu/ngắn gọn hơn nếu có.`;
+
+      // Chuẩn bị payload nội dung (hỗ trợ ảnh đính kèm)
+      let contentsPayload;
+      if (solutionImage) {
+        let mimeType = 'image/jpeg';
+        let base64Data = solutionImage;
+        if (solutionImage.includes(';base64,')) {
+          const parts = solutionImage.split(';base64,');
+          mimeType = parts[0].replace(/^data:/, '') || 'image/jpeg';
+          base64Data = parts[1];
+        } else if (solutionImage.startsWith('data:')) {
+          const commaIdx = solutionImage.indexOf(',');
+          if (commaIdx !== -1) {
+            mimeType = solutionImage.slice(5, commaIdx).replace(';base64', '') || 'image/jpeg';
+            base64Data = solutionImage.slice(commaIdx + 1);
+          }
+        }
+
+        const imagePart = {
+          inlineData: {
+            mimeType: mimeType,
+            data: base64Data
+          }
+        };
+
+        contentsPayload = {
+          parts: [
+            imagePart,
+            { text: promptText }
+          ]
+        };
+      } else {
+        contentsPayload = promptText;
+      }
+
+      const { response, usedModel } = await callGeminiWithResilience({
+        ai,
+        contents: contentsPayload,
+        config: {
+          systemInstruction: 'Bạn là Giáo sư Toán học, Giám khảo Chấm thi và Huấn luyện viên trưởng Đội tuyển Olympic Toán học Quốc gia (VMO) và Quốc tế (TST/IMO). Bạn có tư duy toán học chuẩn xác, đọc và nhận diện thành thạo chữ viết tay toán học trong ảnh. Bạn luôn phân tích khách quan, chỉ rõ chính xác từng lỗi logic, từng bước thiếu điều kiện hoặc khẳng định bài giải tối ưu.',
+          responseMimeType: 'application/json',
+          responseSchema: Type ? {
+            type: Type.OBJECT,
+            properties: {
+              verdict: {
+                type: Type.STRING,
+                description: 'CORRECT_OPTIMAL, CORRECT_SUBOPTIMAL, RIGHT_DIRECTION_INACCURATE, MISSING_CONDITIONS, LOGICAL_GAP, INCORRECT'
+              },
+              verdictLabel: {
+                type: Type.STRING,
+                description: 'Nhãn tiếng Việt hiển thị, ví dụ: Đúng hoàn toàn & Lời giải tối ưu'
+              },
+              verdictColor: {
+                type: Type.STRING,
+                description: 'Mã màu HEX đại diện cho phân loại'
+              },
+              estimatedScore: {
+                type: Type.STRING,
+                description: 'Điểm số ước tính, ví dụ: 4.5/5.0đ'
+              },
+              summary: {
+                type: Type.STRING,
+                description: 'Tóm tắt nhận định tổng quan về bài giải'
+              },
+              approachAnalysis: {
+                type: Type.STRING,
+                description: 'Phân tích hướng tiếp cận và phương pháp toán học'
+              },
+              stepByStep: {
+                type: Type.STRING,
+                description: 'Rà soát chi tiết từng bước lập luận toán học (dùng LaTeX)'
+              },
+              criticalFlaws: {
+                type: Type.STRING,
+                description: 'Lỗ hổng logic hoặc thiếu sót cụ thể'
+              },
+              recommendations: {
+                type: Type.STRING,
+                description: 'Gợi ý hoàn thiện và hướng giải tối ưu chuẩn Olympic'
+              }
+            },
+            required: ['verdict', 'verdictLabel', 'estimatedScore', 'summary', 'approachAnalysis', 'stepByStep', 'recommendations']
+          } : undefined,
+          temperature: 0.15
+        },
+        label: 'Evaluate'
+      });
+
+      if (response && response.text) {
+        const parsed = parseMathJSON(response.text);
+        if (parsed && (parsed.verdict || parsed.summary || parsed.stepByStep)) {
+          // Bổ sung màu sắc chuẩn nếu AI chưa gán
+          if (!parsed.verdictColor) {
+            const v = (parsed.verdict || '').toUpperCase();
+            if (v.includes('OPTIMAL') && !v.includes('SUB')) parsed.verdictColor = '#16a34a';
+            else if (v.includes('SUBOPTIMAL')) parsed.verdictColor = '#0284c7';
+            else if (v.includes('DIRECTION')) parsed.verdictColor = '#d97706';
+            else if (v.includes('CONDITIONS')) parsed.verdictColor = '#ea580c';
+            else if (v.includes('GAP')) parsed.verdictColor = '#e11d48';
+            else parsed.verdictColor = '#dc2626';
+          }
+
+          return res.json({
+            success: true,
+            source: 'gemini',
+            model: usedModel,
+            data: parsed
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.log('[Evaluate] Tự động chuyển sang local expert engine:', err.message);
+  }
+
+  res.status(503).json({ success: false, code: 'AI_UNAVAILABLE', message: 'Dịch vụ AI hiện không khả dụng. Không tạo điểm đánh giá giả.' });
+});
+
+// Set security and cross-origin headers that permit Firebase Auth popup and external CDNs
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  // Chống cache triệt để để trình duyệt luôn lấy mã nguồn JS/CSS mới nhất sau mỗi lần cập nhật
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Surrogate-Control', 'no-store');
+  next();
+});
+
+// Serve static assets from root directory
+app.use(express.static(__dirname, {
+  extensions: ['html', 'htm']
+}));
+
+app.use('/api', (req, res) => res.status(404).json({ success: false, code: 'API_NOT_FOUND', message: 'API không tồn tại.' }));
+
+// Route for root /
+app.get('/', (req, res) => {
+  try {
+    build();
+  } catch (err) {
+    console.warn('[Build Warning]:', err.message);
+  }
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
+
+// Route for login
+app.get('/login', (req, res) => {
+  res.sendFile(path.join(__dirname, 'login.html'));
+});
+
+// Fallback for clean URLs
+app.use((req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
+
+app.use((err, req, res, next) => {
+  const status = err.status || (err.type === 'entity.too.large' ? 413 : 400);
+  res.status(status).json({ success: false, code: status === 413 ? 'PAYLOAD_TOO_LARGE' : 'BAD_REQUEST', message: status === 413 ? 'Dữ liệu gửi lên quá lớn.' : 'Yêu cầu không hợp lệ.' });
+});
+
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) app.listen(PORT, '0.0.0.0', () => console.log(`VMO Da Nang production server running on port ${PORT}`));
+export default app;
